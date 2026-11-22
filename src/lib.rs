@@ -5,6 +5,7 @@
 //!
 //! See README.md for the model binary layout and the protocol mapping.
 
+pub mod calibration_v3;
 pub mod baseline;
 pub mod fixture;
 pub mod format_v2;

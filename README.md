@@ -38,4 +38,4 @@ systemd-юнит закреплён на отдельном ядре с SCHED_FI
 
 [potok-m-ai] · [potok-m-protocol] · [potok-m-sim] · [potok-m-firmware] · [potok-m]
 
-Лицензия: MIT.
+Лицензия: GPL-3.0-or-later (или коммерческая).

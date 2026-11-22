@@ -14,6 +14,7 @@ pub mod model;
 pub mod runtime;
 pub mod simd;
 pub mod speculative;
+pub mod speculative_v3;
 pub mod student_runtime;
 pub mod uart;
 

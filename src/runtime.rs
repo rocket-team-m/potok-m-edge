@@ -10,6 +10,7 @@ use crate::frame::{
 use crate::model::{Model, Scratch};
 use crate::model_v3::V3Model;
 use crate::simd::dot;
+use crate::student_runtime::LoadOptions;
 use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
@@ -332,7 +333,9 @@ impl Runtime {
         let path = path.as_ref();
         let bytes = fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         if bytes.starts_with(&crate::model_v3::MAGIC) {
-            V3Model::from_bytes(&bytes)
+            // POTOKM3 goes through the typed ±10 m/s² command envelope, the
+            // same bound resolution as the v2 student reader (§2.3/§2.4).
+            V3Model::from_bytes_with_options(&bytes, LoadOptions::default())
                 .map(Self::from_v3)
                 .map_err(|e| e.to_string())
         } else if bytes.starts_with(&crate::format_v2::MAGIC) {
@@ -359,7 +362,8 @@ impl Runtime {
         if !bytes.starts_with(&crate::model_v3::MAGIC) {
             return Err("calibration requires a POTOKM3 v3 model".to_owned());
         }
-        let model = V3Model::from_bytes(&bytes).map_err(|e| e.to_string())?;
+        let model = V3Model::from_bytes_with_options(&bytes, LoadOptions::default())
+            .map_err(|e| e.to_string())?;
         let calibration = Calibration::from_file(calibration_path).map_err(|e| e.to_string())?;
         Ok(Self::from_engine(
             Engine::V3(Box::new(V3Engine::new(model, Some(calibration)))),

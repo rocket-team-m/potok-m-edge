@@ -44,7 +44,21 @@
 //! `blocks.{b}.proj`, `stem.{weight,bias}`, `norm.{weight,bias}`,
 //! `alloc_logits`, `head_corr.{weight,bias}`, `head_conf.{weight,bias}` and
 //! `g_max`. Ternary factors are dequantized once; consumers never see codes.
+//!
+//! # Command envelope (FIXRECIPE, 2026-11-23)
+//!
+//! `g_max` (header offset 48 and the `[1]` record) is a linear command bound in
+//! m/s² in exports produced by the typed `potok_ai.student.CommandEnvelope`
+//! (default ±10), **not** the argument to `tanh` that the legacy spec used.
+//! The reader resolves the same [`CommandBoundMode`] as the v2 student reader:
+//! [`CommandBoundMode::EnvelopeMps2`] uses `min(g_max, envelope)`,
+//! [`CommandBoundMode::LegacyV2Tanh`] keeps `tanh(g_max)` for pre-FIXRECIPE
+//! exports, and the default [`CommandBoundMode::Auto`] picks by field value
+//! (`g_max > 1.0` can only be a linear bound because `tanh` is strictly < 1).
+//! A bound outside the envelope, a non-finite/non-positive bound and a
+//! header-vs-record disagreement are loud refusals, never silent clamps.
 
+use crate::student_runtime::{CommandBoundMode, CommandEnvelope, LoadOptions};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
@@ -66,8 +80,11 @@ pub const FP32_LAYER: u8 = 2;
 const CHECKSUM_BYTES: usize = 32;
 const FIXED_HEADER_BYTES: usize = 64;
 const LN_EPS: f32 = 1e-5;
+/// `tanh(x) < 1` for every finite `x`, and the legacy Python default is
+/// exactly 1.0: only a field strictly above this can be a linear m/s² bound.
+const LEGACY_TANH_CEILING: f32 = 1.0;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum V3Error {
     Truncated,
     BadMagic,
@@ -82,6 +99,10 @@ pub enum V3Error {
     ShapeMismatch(&'static str),
     InvalidTernaryCode(i8),
     Utf8,
+    InvalidCommandEnvelope(f32),
+    InvalidCommandBound(f32),
+    CommandOutOfEnvelope(f32, f32),
+    CommandBoundMismatch(f32, f32),
 }
 
 impl fmt::Display for V3Error {
@@ -100,11 +121,40 @@ impl fmt::Display for V3Error {
             Self::ShapeMismatch(s) => write!(f, "v3 shape mismatch: {s}"),
             Self::InvalidTernaryCode(c) => write!(f, "invalid ternary code {c}"),
             Self::Utf8 => write!(f, "v3 layer name is not UTF-8"),
+            Self::InvalidCommandEnvelope(v) => {
+                write!(f, "command envelope must be finite and positive m/s^2, got {v}")
+            }
+            Self::InvalidCommandBound(v) => {
+                write!(f, "invalid v3 g_max {v}: must be finite and positive m/s^2")
+            }
+            Self::CommandOutOfEnvelope(g, ceiling) => write!(
+                f,
+                "v3 g_max {g} m/s^2 exceeds the command envelope ceiling {ceiling} m/s^2; re-export with g_max within the envelope or pass an explicit CommandEnvelope"
+            ),
+            Self::CommandBoundMismatch(header, record) => write!(
+                f,
+                "v3 g_max header {header} != g_max record {record} m/s^2"
+            ),
         }
     }
 }
 
 impl std::error::Error for V3Error {}
+
+fn resolve_bound_mode(mode: CommandBoundMode, g_max: f32) -> CommandBoundMode {
+    match mode {
+        CommandBoundMode::Auto if g_max > LEGACY_TANH_CEILING => CommandBoundMode::EnvelopeMps2,
+        CommandBoundMode::Auto => CommandBoundMode::LegacyV2Tanh,
+        other => other,
+    }
+}
+
+fn active_command_bound(mode: CommandBoundMode, g_max: f32, ceiling: f32) -> f32 {
+    match mode {
+        CommandBoundMode::EnvelopeMps2 => g_max.min(ceiling),
+        CommandBoundMode::LegacyV2Tanh | CommandBoundMode::Auto => g_max.tanh(),
+    }
+}
 
 struct Reader<'a> {
     b: &'a [u8],
@@ -203,7 +253,12 @@ pub struct V3Model {
     pub flags: u32,
     pub target_version: u32,
     pub dilations: Vec<usize>,
-    /// `tanh(|g_max|)`, the head's correction bound.
+    /// Bound mode actually resolved at load (`Auto` is resolved away).
+    pub bound_mode: CommandBoundMode,
+    /// The envelope the bound was checked against.
+    pub command_envelope: CommandEnvelope,
+    /// Active head correction bound: `min(g_max, envelope)` in envelope mode,
+    /// `tanh(g_max)` in legacy mode. Corrections are `tanh(head) * bound`.
     pub correction_bound: f32,
     pub stem_w: Vec<f32>,
     pub stem_b: Vec<f32>,
@@ -219,13 +274,30 @@ pub struct V3Model {
 
 impl V3Model {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, V3Error> {
+        Self::from_file_with_options(path, LoadOptions::default())
+    }
+
+    /// Load with an explicit command envelope / bound mode (the typed legacy flag).
+    pub fn from_file_with_options(
+        path: impl AsRef<Path>,
+        options: LoadOptions,
+    ) -> Result<Self, V3Error> {
         let bytes = fs::read(path).map_err(|_| V3Error::Truncated)?;
-        Self::from_bytes(&bytes)
+        Self::from_bytes_with_options(&bytes, options)
+    }
+
+    /// Load with the default `Auto` mode and the ±10 m/s² envelope.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, V3Error> {
+        Self::from_bytes_with_options(bytes, LoadOptions::default())
     }
 
     /// Verify SHA-256, parse the canonical header and records, dequantize every
-    /// ternary factor once. Every refusal is loud; there is no partial result.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, V3Error> {
+    /// ternary factor once, and resolve the typed command bound. Every refusal
+    /// is loud; there is no partial result.
+    pub fn from_bytes_with_options(bytes: &[u8], options: LoadOptions) -> Result<Self, V3Error> {
+        if !options.envelope.accel.is_finite() || options.envelope.accel <= 0.0 {
+            return Err(V3Error::InvalidCommandEnvelope(options.envelope.accel));
+        }
         if bytes.len() < FIXED_HEADER_BYTES + CHECKSUM_BYTES {
             return Err(V3Error::Truncated);
         }
@@ -272,12 +344,13 @@ impl V3Model {
             || !(1..=MAX_LOOPS).contains(&n_loops)
             || !decay.is_finite()
             || !(0.0..=1.0).contains(&decay)
-            || !g_max.is_finite()
-            || g_max <= 0.0
             || flags != 1
             || n_records != 5 * n_blocks + 10
         {
             return Err(V3Error::InvalidField("header counts"));
+        }
+        if !g_max.is_finite() || g_max <= 0.0 {
+            return Err(V3Error::InvalidCommandBound(g_max));
         }
         let dilations: Vec<usize> = (0..n_blocks)
             .map(|_| r.u32().map(|d| d as usize))
@@ -407,8 +480,16 @@ impl V3Model {
         let head_conf_b = tensor("head_conf.bias", &[1])?;
         let file_g_max = tensor("g_max", &[1])?[0];
         if !file_g_max.is_finite() || file_g_max <= 0.0 {
-            return Err(V3Error::InvalidField("g_max tensor"));
+            return Err(V3Error::InvalidCommandBound(file_g_max));
         }
+        if g_max != file_g_max {
+            return Err(V3Error::CommandBoundMismatch(g_max, file_g_max));
+        }
+        let mode = resolve_bound_mode(options.mode, g_max);
+        if mode == CommandBoundMode::EnvelopeMps2 && g_max > options.envelope.accel {
+            return Err(V3Error::CommandOutOfEnvelope(g_max, options.envelope.accel));
+        }
+        let correction_bound = active_command_bound(mode, g_max, options.envelope.accel);
 
         Ok(Self {
             in_features,
@@ -420,10 +501,12 @@ impl V3Model {
             n_loops,
             decay,
             g_max,
+            bound_mode: mode,
+            command_envelope: options.envelope,
             flags,
             target_version,
             dilations,
-            correction_bound: g_max.abs().tanh(),
+            correction_bound,
             stem_w,
             stem_b,
             blocks,

@@ -105,13 +105,15 @@ Records: `blocks.{b}.{rec_h,rec_x}.{weight,bias}`, `blocks.{b}.proj` (TSCT),
 finite, > 0). The head bound exposed to consumers is `tanh(|g_max|)`
 (`src/model_v3.rs:358-426`).
 
-**Wiring state.** `V3Model` is a canonical reader exported from the library
-(`src/lib.rs:15, 27`), and `src/speculative_v3.rs` is a predictor-agnostic
-dispatch/guard with fixture-driven gates. `Runtime::load` currently dispatches
-only on `POTOKM1\0` versus the legacy POTM reader (`src/runtime.rs:149-163`); a
+**Wiring state.** `V3Model` is the canonical v3 reader: it is exported from
+the library (`src/lib.rs:15, 27`) and exercised byte-for-byte by
+`tests/model_v3_tests.rs`. `src/speculative_v3.rs` is a predictor-agnostic
+dispatch/guard with fixture-driven gates. `Runtime::load` still dispatches only
+on `POTOKM1\0` versus the legacy POTM reader (`src/runtime.rs:149-163`): a
 `POTOKM3\0` file is not loaded by the production entry point, and calibration is
 not applied in the dispatch path (§4). These are integration gaps, not format
-differences.
+differences — the reader and the guard exist, but neither is wired into
+`Runtime::load` yet.
 
 ## 3. SHA policy
 
@@ -161,11 +163,15 @@ Python reader. There is **no fallback to raw confidence**. The adaptive-compute
 threshold is data-derived: `threshold` from the JSON for
 temperature/isotonic, `1 / (1 + q_hat)` for conformal; never a constant.
 
-`pub mod calibration_v3;` is present (`src/lib.rs:9`). No dispatch call site
-consumes `Calibration` today: the v3 dispatch takes the confidence returned by
-its predictor directly (`src/speculative_v3.rs:437-440, 489-494`). Until that
-wiring exists, the contract for calibration is the reader and transform, not an
-endpoint guarantee that every emitted confidence is calibrated.
+`pub mod calibration_v3;` is present (`src/lib.rs:9`) and the reader/transform
+are gated by `tests/calibration_v3_tests.rs`. No dispatch call site consumes
+`Calibration` today: the v3 dispatch takes the confidence returned by its
+predictor directly (`src/speculative_v3.rs:437-440, 489-494`) and uses its own
+`DEFAULT_CONFIDENCE_THRESHOLD = 0.7` (`src/speculative_v3.rs:30`). That constant
+is dispatch configuration, **not** the data-derived calibration threshold
+described above. Until the wiring exists, the contract for calibration is the
+reader and transform, not an endpoint guarantee that every emitted confidence
+is calibrated.
 
 ## 5. Watchguard decisions
 
@@ -227,6 +233,13 @@ guard calls and each reason are counted in `V3Counters`. The protocol's
   285.4/372.5 µs; worst cycle 1.071 ms including 0.61 ms UART wire, under the
   10 ms budget (`BUILD_LOG.md:250-253`). The bench gate fails loudly above
   10 ms (`src/bin/bench_spec.rs:238-245`).
+- The deterministic lowlat perf gates (`tests/lowlat_perf_hard_tests.rs`) time
+  fixed-seed `decode_request → on_request → encode_reply` (16 warmup + 128 timed
+  frames, seed `0x504F544B`) and split model from overhead. On this x86 host in
+  release they report full-cycle p50/p99 ≈ 170/236 µs (model ≈ 169/235 µs,
+  decode ≈ 0.26/0.31 µs, encode ≈ 0.21/0.28 µs) under their own percentile
+  convention (§7). Informational only: the gate asserts structure and a pinned
+  checksum, not a microsecond threshold, and none of it is Pi evidence.
 - Status: p99 on a real Pi 4 B is **not measured**; NEON is compile-checked for
   aarch64, not executed here (`BUILD_LOG.md:63-67`, `potok-m/PI4_BUDGET.md:41-45`).
   A debug-build integration test has previously reported p99 above 10 ms
@@ -236,12 +249,15 @@ guard calls and each reason are counted in `V3Counters`. The protocol's
 
 ## 7. p50/p99 measurement
 
-- Percentile definition used by this repo:
+- Two percentile conventions coexist in this repo. The bench binaries use
   `sorted[round((len - 1) * q)]`, on durations sorted ascending — nearest-rank,
   with the sample count fixed by `--frames` (`src/bin/bench.rs:14-20`,
-  `src/bin/bench_v3.rs:62-67`, `src/bin/bench_spec.rs:28-33`). It is not the
-  interpolation convention used elsewhere in the project; quote the instrument
-  with the number.
+  `src/bin/bench_v3.rs:62-67`, `src/bin/bench_spec.rs:28-33`). The deterministic
+  lowlat perf gates use linear interpolation instead — rank `q·(n−1)` between
+  the two neighbours (numpy `method="linear"`), pinned on `1..=9`
+  (`p50 = 5.0`, `p99 = 8.92`) and on a tied array (`p50 = 4.5`, `p99 = 8.86`)
+  (`tests/lowlat_perf_hard_tests.rs:48-66, 177-195`). The two differ by at most
+  half a sample gap; quote the instrument with the number.
 - `bench` times `decode_request → on_request → encode_reply` as the full cycle
   and reports model-only and overhead-only percentiles plus memory and an output
   checksum; `--compare` adds the naive control (`src/bin/bench.rs:86-95, 137-169`).

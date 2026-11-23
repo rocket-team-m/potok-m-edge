@@ -40,10 +40,11 @@
 //! the tick. These three points deliberately supersede the older
 //! SPEC_STUDENT.md text; the canonical Python implementation is the authority.
 //!
-//! `in_features` comes from the header: **10** for the legacy frame (8 sensors
-//! + phase + flags) or **20** for the smart frame (14 physics features followed
-//! by the 6 vehicle-conditioning numbers). `step` accepts any frame up to that
-//! width and zero-pads the tail, matching the Python `_as_frame` helper.
+//! `in_features` comes from the header: **10** for the legacy frame
+//! (8 sensors, phase and flags) or **20** for the smart frame (14 physics
+//! features followed by the 6 vehicle-conditioning numbers). `step` accepts
+//! any frame up to that width and zero-pads the tail, matching the Python
+//! `_as_frame` helper.
 
 use crate::simd::dot;
 use sha2::{Digest, Sha256};
@@ -123,7 +124,7 @@ pub fn model_kind(bytes: &[u8]) -> Result<u32, StudentError> {
     if bytes.len() < 16 {
         return Err(StudentError::Truncated);
     }
-    if &bytes[..8] != MAGIC {
+    if bytes[..8] != MAGIC {
         return Err(StudentError::BadMagic);
     }
     let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
@@ -166,14 +167,16 @@ impl<'a> Reader<'a> {
     }
     fn f32s(&mut self, n: usize) -> Result<Vec<f32>, StudentError> {
         let b = self.take(n.checked_mul(4).ok_or(StudentError::Truncated)?)?;
-        Ok(b.chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        Ok(b.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| f32::from_le_bytes(c))
             .collect())
     }
     fn codes(&mut self, n: usize) -> Result<Vec<i8>, StudentError> {
         let b = self.take(n)?;
         let v: Vec<i8> = b.iter().map(|&x| x as i8).collect();
-        if let Some(&bad) = v.iter().find(|c| !matches!(c, -1 | 0 | 1)) {
+        if let Some(&bad) = v.iter().find(|c| !matches!(c, -1..=1)) {
             return Err(StudentError::InvalidTernaryCode(bad));
         }
         Ok(v)
@@ -496,9 +499,9 @@ impl StudentRuntime {
         let n = model.n_blocks * model.width;
         let mut alloc = vec![0.0f32; model.n_loops];
         let mut max = f32::NEG_INFINITY;
-        for l in 0..model.n_loops {
-            alloc[l] = model.alloc[l];
-            max = max.max(alloc[l]);
+        for (l, dst) in alloc.iter_mut().enumerate().take(model.n_loops) {
+            *dst = model.alloc[l];
+            max = max.max(*dst);
         }
         let mut sum = 0.0f32;
         for a in alloc.iter_mut() {
@@ -607,10 +610,10 @@ impl StudentRuntime {
             &mut self.z,
         );
         let mut out = [0.0f32; 3];
-        for k in 0..self.model.out_features {
-            out[k] = dot(&self.model.head_corr_w[k * w..(k + 1) * w], &self.z)
+        for (k, dst) in out.iter_mut().enumerate().take(self.model.out_features) {
+            *dst = dot(&self.model.head_corr_w[k * w..(k + 1) * w], &self.z)
                 + self.model.head_corr_b[k];
-            out[k] = out[k].tanh() * self.model.correction_bound;
+            *dst = dst.tanh() * self.model.correction_bound;
         }
         let conf = dot(&self.model.head_conf_w[..w], &self.z) + self.model.head_conf_b[0];
         out[2] = 1.0 / (1.0 + (-conf).exp());
@@ -681,7 +684,7 @@ impl Lcg {
     }
 }
 
-fn put_u32(b: &mut Vec<u8>, off: usize, v: u32) {
+fn put_u32(b: &mut [u8], off: usize, v: u32) {
     b[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
 fn push_u32(b: &mut Vec<u8>, v: u32) {

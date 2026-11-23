@@ -88,15 +88,17 @@ impl<'a> Reader<'a> {
     fn f32s(&mut self, n: usize) -> Result<Vec<f32>, V2Error> {
         let bytes = self.take(n.checked_mul(4).ok_or(V2Error::Truncated)?)?;
         Ok(bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| f32::from_le_bytes(c))
             .collect())
     }
 
     fn codes(&mut self, n: usize) -> Result<Vec<i8>, V2Error> {
         let bytes = self.take(n)?;
         let v: Vec<i8> = bytes.iter().map(|&b| b as i8).collect();
-        if let Some(&bad) = v.iter().find(|c| !matches!(c, -1 | 0 | 1)) {
+        if let Some(&bad) = v.iter().find(|c| !matches!(c, -1..=1)) {
             return Err(V2Error::InvalidTernaryCode(bad));
         }
         Ok(v)
@@ -202,7 +204,7 @@ impl ModelV2 {
             || rank == 0
             || kernel == 0
             || n_blocks == 0
-            || dilations.iter().any(|&d| d == 0)
+            || dilations.contains(&0)
             || n_records != 5 * n_blocks + 6
         {
             return Err(V2Error::InvalidField("header counts"));
@@ -425,10 +427,10 @@ impl ModelV2 {
                 for ci in 0..c {
                     let mut acc = block.dw_b[ci];
                     let kw = &block.dw_w[ci * self.kernel..(ci + 1) * self.kernel];
-                    for j in 0..self.kernel {
+                    for (j, &w) in kw.iter().enumerate() {
                         let src = ti + j * dilation;
                         if src >= pad {
-                            acc += kw[j] * self.block_in[(src - pad) * c + ci];
+                            acc += w * self.block_in[(src - pad) * c + ci];
                         }
                     }
                     self.conv[ci] = acc;
@@ -445,9 +447,9 @@ impl ModelV2 {
         let last = &self.x[(t - 1) * c..t * c];
         Self::layer_norm(last, &self.norm_w, &self.norm_b, &mut self.head);
         let mut raw = [0.0f32; 3];
-        for k in 0..self.out_features {
+        for (k, dst) in raw.iter_mut().enumerate().take(self.out_features) {
             let w = &self.head_w[k * c..(k + 1) * c];
-            raw[k] = dot(w, &self.head) + self.head_b[k];
+            *dst = dot(w, &self.head) + self.head_b[k];
         }
         [
             raw[0].tanh() * self.g_max,

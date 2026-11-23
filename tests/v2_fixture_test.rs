@@ -34,8 +34,10 @@ fn read_npy_f32(path: PathBuf) -> Vec<f32> {
         .collect();
     let count: usize = dims.iter().product();
     let data = &d[10 + hlen..10 + hlen + count * 4];
-    data.chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+    data.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&c| f32::from_le_bytes(c))
         .collect()
 }
 

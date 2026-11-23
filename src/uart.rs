@@ -57,20 +57,20 @@ pub fn handle_request<L: FrameLayout>(
     runtime: &mut Runtime,
     bytes: &[u8],
     reply_buf: &mut [u8],
-) -> Result<(), ()> {
+) -> Result<(), FrameError> {
     let req: RequestFrame = match layout.decode_request(bytes) {
         Ok(r) => r,
-        Err(FrameError::VersionMismatch(_)) => {
+        Err(e @ FrameError::VersionMismatch(_)) => {
             runtime.disable_now();
-            return Err(());
+            return Err(e);
         }
-        Err(_) => {
+        Err(e) => {
             runtime.on_invalid_frame();
-            return Err(());
+            return Err(e);
         }
     };
     let reply = runtime.on_request(&req);
-    layout.encode_reply(&reply, reply_buf).map_err(|_| ())
+    layout.encode_reply(&reply, reply_buf)
 }
 
 /// Speculative counterpart of `handle_request`. A bad frame gets a fault
@@ -80,7 +80,7 @@ pub fn handle_spec_request<L: FrameLayout>(
     runtime: &mut SpeculativeRuntime,
     bytes: &[u8],
     reply_buf: &mut [u8],
-) -> Result<(), ()> {
+) -> Result<(), FrameError> {
     let reply = match layout.decode_request(bytes) {
         Ok(req) => runtime.on_request(&req),
         Err(FrameError::VersionMismatch(_)) => {
@@ -92,7 +92,7 @@ pub fn handle_spec_request<L: FrameLayout>(
             ReplyFrame::muted(0, false)
         }
     };
-    layout.encode_reply(&reply, reply_buf).map_err(|_| ())
+    layout.encode_reply(&reply, reply_buf)
 }
 
 /// Run until the process is stopped. One read per 20 ms tick, 8 ms read
@@ -136,7 +136,7 @@ pub fn run_loop<L: FrameLayout, T: Transport>(
                         runtime.on_invalid_frame();
                     }
                 }
-                Err(()) => { /* counted inside handle_request */ }
+                Err(_) => { /* counted inside handle_request */ }
             }
         }
         let elapsed = tick.elapsed();

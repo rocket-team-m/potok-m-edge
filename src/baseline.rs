@@ -90,9 +90,9 @@ pub fn forward_naive(model: &Model, window: &[f32]) -> [f32; 3] {
         head[ci] = last[ci] * inv * model.final_norm[ci];
     }
     let mut out = [0.0f32; 3];
-    for o in 0..model.out_features {
+    for (o, dst) in out.iter_mut().enumerate().take(model.out_features) {
         let row = &model.out_w[o * c..(o + 1) * c];
-        out[o] = dot_scalar(row, &head) + model.out_b[o];
+        *dst = dot_scalar(row, &head) + model.out_b[o];
     }
     out
 }

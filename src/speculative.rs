@@ -2,13 +2,16 @@
 //! teacher by exception (low confidence / invalid sensors, or every 20 frames).
 //!
 //! Rules from SPEC_STUDENT.md §"Правила dispatch":
-//! 1. student every frame; 2. apply it when confidence >= 0.7 and sensors are
-//! valid; 3. otherwise call the teacher on the last 50 frames and apply that;
+//! 1. student every frame;
+//! 2. apply it when confidence >= 0.7 and sensors are valid;
+//! 3. otherwise call the teacher on the last 50 frames and apply that;
 //! 4. every 20 frames a forced teacher check compares `|g_t - g_s|` and, above
-//! `3*g_max`, logs an event and re-warms the student from the same window;
-//! 5. BURN (phase 0) outputs zero on both paths; 6. bad CRC or sequence gaps
-//! bypass both models. A cycle makes **at most one** teacher call — the
-//! low-confidence and forced conditions share the same single call.
+//!    `3*g_max`, logs an event and re-warms the student from the same window;
+//! 5. BURN (phase 0) outputs zero on both paths;
+//! 6. bad CRC or sequence gaps bypass both models.
+//!
+//! A cycle makes **at most one** teacher call — the low-confidence and forced
+//! conditions share the same single call.
 
 use crate::frame::{
     ReplyFrame, RequestFrame, CORRECTION_SCALE, FLAG_FAULT, FLAG_IMU_OK, PHASE_BURN,

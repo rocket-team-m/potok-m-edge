@@ -136,7 +136,7 @@ impl Model {
         if expected.as_slice() != digest {
             return Err(ModelError::ChecksumMismatch);
         }
-        if &body[0..4] != MAGIC {
+        if body[0..4] != MAGIC {
             return Err(ModelError::BadMagic);
         }
         let version = u32::from_le_bytes(body[4..8].try_into().unwrap());
@@ -361,9 +361,9 @@ impl Model {
             scratch[i] = last[i] * inv * self.final_norm[i];
         }
         let mut o = [0.0f32; 3];
-        for k in 0..self.out_features {
+        for (k, dst) in o.iter_mut().enumerate().take(self.out_features) {
             let row = &self.out_w[k * c..(k + 1) * c];
-            o[k] = crate::simd::dot(row, &scratch[..c]) + self.out_b[k];
+            *dst = crate::simd::dot(row, &scratch[..c]) + self.out_b[k];
         }
         (o[0], o[1], o[2])
     }
@@ -412,20 +412,20 @@ impl Model {
                 }
                 let xrow = &mut x[base..base + c];
                 // depthwise causal conv + SiLU + residual
-                for ci in 0..c {
+                for (ci, dst) in xrow.iter_mut().enumerate().take(c) {
                     let mut acc = layer.dw_b[ci];
                     let kw = &layer.dw_w[ci * k..(ci + 1) * k];
-                    for lag in 0..k {
+                    for (lag, &weight) in kw.iter().enumerate() {
                         if ti >= lag {
                             let v = if lag == 0 {
                                 scratch.norm1[base + ci]
                             } else {
                                 scratch.norm1[(ti - lag) * c + ci]
                             };
-                            acc += v * kw[lag];
+                            acc += v * weight;
                         }
                     }
-                    xrow[ci] += acc / (1.0 + (-acc).exp());
+                    *dst += acc / (1.0 + (-acc).exp());
                 }
                 // norm2 over channels of the post-convolution residual
                 let mean = xrow.iter().map(|v| v * v).sum::<f32>() / c as f32;
@@ -445,9 +445,9 @@ impl Model {
                     scratch.up[di] = a / (1.0 + (-a).exp());
                 }
                 let up = &scratch.up[..d];
-                for ci in 0..c {
+                for (ci, dst) in xrow.iter_mut().enumerate().take(c) {
                     let w = &layer.down_w[ci * d..(ci + 1) * d];
-                    xrow[ci] += dot(w, up);
+                    *dst += dot(w, up);
                 }
             }
         }

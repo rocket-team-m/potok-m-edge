@@ -110,18 +110,36 @@ fn conformal_without_bin_map_uses_exact_quantile() {
     ] {
         assert_close(c.apply_logit(z).unwrap(), expected);
     }
-    // The exported step map uses "first upper edge >= p", so at p == p_hat it
-    // lands on the lower value; the exact route uses s <= q_hat and is 1.
-    // Both are pinned to the Python reference, including their boundary.
-    let boundary = -0.9162907318741551; // -ln(2.5), q_hat = 2.5
+    // Canonical boundary: inclusive lower edge. At p == p_hat both the bin-map
+    // route and the exact s <= q_hat route return 1 (confident).
+    let boundary = -0.9162907318741551; // -ln(2.5), q_hat = 2.5 -> p_hat = 1/3.5
     assert_close(
         Calibration::from_json(CONF_JSON)
             .unwrap()
             .apply_logit(boundary)
             .unwrap(),
-        0.0,
+        1.0,
     );
     assert_close(c.apply_logit(boundary).unwrap(), 1.0);
+}
+
+#[test]
+fn conformal_bin_map_is_inclusive_at_p_hat() {
+    // q_hat = 2.5 -> p_hat = 1/3.5. z = -ln(2.5) gives sigmoid(z) == p_hat.
+    let boundary = -0.9162907318741551;
+    let with_map = Calibration::from_json(CONF_JSON).unwrap();
+    let exact = Calibration::from_json(CONF_NOBIN_JSON).unwrap();
+    assert_close(with_map.threshold(), exact.threshold());
+    assert_close(with_map.apply_logit(boundary).unwrap(), 1.0);
+    assert_close(exact.apply_logit(boundary).unwrap(), 1.0);
+
+    // Just below / above the boundary the two routes still agree.
+    for z in [-0.92_f64, -0.91] {
+        assert_close(
+            with_map.apply_logit(z).unwrap(),
+            exact.apply_logit(z).unwrap(),
+        );
+    }
 }
 
 #[test]

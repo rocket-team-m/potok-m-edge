@@ -8,10 +8,13 @@
 //! The transform mirrors the Python reference on the edge:
 //!   * temperature: `sigmoid(z / T)`;
 //!   * isotonic: `step(sigmoid(z))`, first upper edge >= p, last value held;
-//!   * split-conformal: the same step over `p = sigmoid(z)`, where the export's
+//!   * split-conformal: over `p = sigmoid(z)`, where the export's
 //!     `p = 1 / (1 + |error| / tol)` coordinate is the confidence coordinate
-//!     (`potok_ai.conformal.monotone_bin_map`). Without an exported map the
-//!     decision is reconstructed exactly as `p >= 1 / (1 + q_hat)`.
+//!     (`potok_ai.conformal.monotone_bin_map`). Canonical boundary is the
+//!     INCLUSIVE LOWER EDGE: confident iff `p >= p_hat = 1/(1 + q_hat)`, so at
+//!     `p == p_hat` the bin map and the exact `p >= 1/(1 + q_hat)` route agree.
+//!     The conformal step reader uses "first upper edge > p" (last value held),
+//!     matching `potok_ai.conformal.apply_confidence`.
 //!
 //! The adaptive-compute threshold is data-derived: `threshold` from the JSON
 //! for temperature/isotonic, `1 / (1 + q_hat)` for conformal. It is never a
@@ -197,7 +200,7 @@ impl Calibration {
             Method::Isotonic => Ok(self.step(p)),
             Method::SplitConformal => {
                 if !self.bins.is_empty() {
-                    Ok(self.step(p))
+                    Ok(self.conformal_step(p))
                 } else {
                     let q = self
                         .q_hat
@@ -209,8 +212,17 @@ impl Calibration {
     }
 
     /// First upper edge >= p, holding the last value past the final edge.
+    /// Used by isotonic, whose Python reference uses this convention.
     fn step(&self, p: f64) -> f64 {
         let index = self.bins.partition_point(|edge| *edge < p);
+        self.values[index.min(self.values.len() - 1)]
+    }
+
+    /// Conformal step reader: first upper edge strictly greater than `p`,
+    /// holding the last value past the final edge. This makes each bin's
+    /// LOWER edge inclusive, so `p >= p_hat` is confident at equality.
+    fn conformal_step(&self, p: f64) -> f64 {
+        let index = self.bins.partition_point(|edge| *edge <= p);
         self.values[index.min(self.values.len() - 1)]
     }
 }

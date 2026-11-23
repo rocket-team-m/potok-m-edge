@@ -36,9 +36,22 @@
 //! becomes the next block's input), and iteration outputs are accumulated with
 //! `softmax(alloc_logits) * decay^loop`. The final feature is
 //! `LayerNorm(total + source)` where `source` is the last block's output;
-//! a `tanh` head scaled by `tanh(|g_max|)` and a sigmoid confidence finish
-//! the tick. These three points deliberately supersede the older
+//! a `tanh` head scaled by the active command bound and a sigmoid confidence
+//! finish the tick. These three points deliberately supersede the older
 //! SPEC_STUDENT.md text; the canonical Python implementation is the authority.
+//!
+//! # Command envelope (FIXRECIPE, 2026-11-23)
+//!
+//! `g_max` is an m/s² command bound in exports produced by the typed
+//! `potok_ai.student.CommandEnvelope` (default ±10), **not** the argument to
+//! `tanh` that the legacy v2 spec used. This reader resolves a
+//! [`CommandBoundMode`] at load: [`CommandBoundMode::EnvelopeMps2`] uses
+//! `|g_max|` capped by the envelope; [`CommandBoundMode::LegacyV2Tanh`] keeps
+//! the old `tanh(|g_max|)` for pre-FIXRECIPE exports. The default
+//! [`CommandBoundMode::Auto`] picks by field value: `g_max > 1.0` can only be
+//! a linear bound (`tanh` is strictly < 1), so it selects the envelope, and
+//! `1.0` and below (the legacy Python default) keep the old interpretation.
+//! A bound outside the envelope is refused loudly, never silently clamped.
 //!
 //! `in_features` comes from the header: **10** for the legacy frame
 //! (8 sensors, phase and flags) or **20** for the smart frame (14 physics
@@ -69,8 +82,78 @@ pub const COND_FEATURES: usize = 6;
 pub const SMART_FRAME_FEATURES: usize = PHYSICS_FEATURES + COND_FEATURES;
 const CHECKSUM_BYTES: usize = 32;
 const LN_EPS: f32 = 1e-5;
+/// `tanh(x) < 1` for every finite `x`, and the legacy Python default is
+/// exactly 1.0: only a field strictly above this can be a linear m/s² bound,
+/// so `Auto` reads 1.0 and below as the legacy tanh-bound field.
+const LEGACY_TANH_CEILING: f32 = 1.0;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Authoritative v3 fin-command envelope in m/s², mirrored from the frozen
+/// `potok_ai.student.CommandEnvelope` (FIXRECIPE, 2026-11-23). The simulator
+/// clamps the flown command to ±10 m/s²; this is a unit contract from the
+/// simulator, not a tuning knob.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CommandEnvelope {
+    pub accel: f32,
+}
+
+impl CommandEnvelope {
+    pub const DEFAULT: Self = Self { accel: 10.0 };
+
+    pub fn new(accel: f32) -> Result<Self, StudentError> {
+        if !accel.is_finite() || accel <= 0.0 {
+            return Err(StudentError::InvalidCommandEnvelope(accel));
+        }
+        Ok(Self { accel })
+    }
+}
+
+/// How the exported `g_max` field becomes the head's correction bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandBoundMode {
+    /// `g_max` is a linear m/s² command bound, capped by the envelope.
+    EnvelopeMps2,
+    /// Pre-FIXRECIPE v2: `tanh(|g_max|)`, strictly below 1 m/s².
+    LegacyV2Tanh,
+    /// `g_max >= 1.0` → [`Self::EnvelopeMps2`], else [`Self::LegacyV2Tanh`].
+    Auto,
+}
+
+impl CommandBoundMode {
+    fn resolve(self, g_max: f32) -> Self {
+        match self {
+            Self::Auto if g_max > LEGACY_TANH_CEILING => Self::EnvelopeMps2,
+            Self::Auto => Self::LegacyV2Tanh,
+            mode => mode,
+        }
+    }
+
+    fn bound(self, g_max: f32, ceiling: f32) -> f32 {
+        match self {
+            Self::EnvelopeMps2 => g_max.min(ceiling),
+            Self::LegacyV2Tanh | Self::Auto => g_max.tanh(),
+        }
+    }
+}
+
+/// Typed loader options. The default keeps existing v2 exports working while
+/// new ±10 m/s² exports take the envelope path; pass an explicit mode when the
+/// field value alone is ambiguous (e.g. a tight custom envelope below 1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LoadOptions {
+    pub mode: CommandBoundMode,
+    pub envelope: CommandEnvelope,
+}
+
+impl Default for LoadOptions {
+    fn default() -> Self {
+        Self {
+            mode: CommandBoundMode::Auto,
+            envelope: CommandEnvelope::DEFAULT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum StudentError {
     Truncated,
     BadMagic,
@@ -83,6 +166,10 @@ pub enum StudentError {
     ShapeMismatch(&'static str),
     InvalidTernaryCode(i8),
     Utf8,
+    InvalidCommandEnvelope(f32),
+    InvalidCommandBound(f32),
+    CommandOutOfEnvelope(f32, f32),
+    CommandBoundMismatch(f32, f32),
 }
 
 impl fmt::Display for StudentError {
@@ -99,6 +186,20 @@ impl fmt::Display for StudentError {
             Self::ShapeMismatch(s) => write!(f, "student shape mismatch: {s}"),
             Self::InvalidTernaryCode(c) => write!(f, "invalid ternary code {c}"),
             Self::Utf8 => write!(f, "student layer name is not UTF-8"),
+            Self::InvalidCommandEnvelope(v) => {
+                write!(f, "command envelope must be finite and positive m/s^2, got {v}")
+            }
+            Self::InvalidCommandBound(v) => {
+                write!(f, "invalid student g_max {v}: must be finite and positive m/s^2")
+            }
+            Self::CommandOutOfEnvelope(g, ceiling) => write!(
+                f,
+                "student g_max {g} m/s^2 exceeds the command envelope ceiling {ceiling} m/s^2; re-export with g_max within the envelope or pass an explicit CommandEnvelope"
+            ),
+            Self::CommandBoundMismatch(header, record) => write!(
+                f,
+                "student g_max header {header} != g_max record {record} m/s^2"
+            ),
         }
     }
 }
@@ -220,9 +321,15 @@ pub struct StudentModel {
     pub n_blocks: usize,
     pub n_loops: usize,
     pub decay: f32,
+    /// The exported command bound in m/s² (raw header field, never tanh-compressed).
     pub g_max: f32,
     pub flags: u32,
-    /// `tanh(|g_max|)`, the head's correction bound in the Python model.
+    /// The bound mode actually resolved at load (`Auto` is resolved away).
+    pub bound_mode: CommandBoundMode,
+    /// The envelope the bound was checked against.
+    pub command_envelope: CommandEnvelope,
+    /// Active head correction bound: `min(g_max, envelope)` in envelope mode,
+    /// `tanh(|g_max|)` in legacy mode. Corrections are `tanh(head) * bound`.
     pub correction_bound: f32,
     blocks: Vec<StudentBlock>,
     stem_w: Vec<f32>,
@@ -241,7 +348,29 @@ impl StudentModel {
         Self::from_bytes(&fs::read(path).map_err(|_| StudentError::Truncated)?)
     }
 
+    /// Load with an explicit command envelope / bound mode (the typed legacy flag).
+    pub fn from_file_with_options(
+        path: impl AsRef<Path>,
+        options: LoadOptions,
+    ) -> Result<Self, StudentError> {
+        Self::from_bytes_with_options(
+            &fs::read(path).map_err(|_| StudentError::Truncated)?,
+            options,
+        )
+    }
+
+    /// Load with the typed command envelope and the default `Auto` bound mode.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, StudentError> {
+        Self::from_bytes_with_options(bytes, LoadOptions::default())
+    }
+
+    pub fn from_bytes_with_options(
+        bytes: &[u8],
+        options: LoadOptions,
+    ) -> Result<Self, StudentError> {
+        if !options.envelope.accel.is_finite() || options.envelope.accel <= 0.0 {
+            return Err(StudentError::InvalidCommandEnvelope(options.envelope.accel));
+        }
         if bytes.len() < HEADER_BYTES + CHECKSUM_BYTES {
             return Err(StudentError::Truncated);
         }
@@ -281,10 +410,12 @@ impl StudentModel {
             || !(1..=3).contains(&n_loops)
             || !decay.is_finite()
             || !(0.0..=1.0).contains(&decay)
-            || !g_max.is_finite()
             || n_records < 6 * n_blocks + 8
         {
             return Err(StudentError::InvalidField("header counts"));
+        }
+        if !g_max.is_finite() || g_max <= 0.0 {
+            return Err(StudentError::InvalidCommandBound(g_max));
         }
 
         let mut layers: HashMap<String, LayerData> = HashMap::with_capacity(n_records);
@@ -416,7 +547,20 @@ impl StudentModel {
         let head_conf_w = tensor("head_conf.weight", &[1, width])?;
         let head_conf_b = tensor("head_conf.bias", &[1])?;
         let g_max_tensor = tensor("g_max", &[1])?[0];
-        let correction_bound = g_max_tensor.abs().tanh();
+        if !g_max_tensor.is_finite() || g_max_tensor <= 0.0 {
+            return Err(StudentError::InvalidCommandBound(g_max_tensor));
+        }
+        if g_max != g_max_tensor {
+            return Err(StudentError::CommandBoundMismatch(g_max, g_max_tensor));
+        }
+        let mode = options.mode.resolve(g_max);
+        if mode == CommandBoundMode::EnvelopeMps2 && g_max > options.envelope.accel {
+            return Err(StudentError::CommandOutOfEnvelope(
+                g_max,
+                options.envelope.accel,
+            ));
+        }
+        let correction_bound = mode.bound(g_max, options.envelope.accel);
 
         Ok(Self {
             in_features,
@@ -428,6 +572,8 @@ impl StudentModel {
             decay,
             g_max,
             flags,
+            bound_mode: mode,
+            command_envelope: options.envelope,
             correction_bound,
             blocks,
             stem_w,
@@ -526,6 +672,16 @@ impl StudentRuntime {
 
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, StudentError> {
         Ok(Self::new(StudentModel::from_file(path)?))
+    }
+
+    /// Load with an explicit command envelope / bound mode (the typed legacy flag).
+    pub fn from_file_with_options(
+        path: impl AsRef<Path>,
+        options: LoadOptions,
+    ) -> Result<Self, StudentError> {
+        Ok(Self::new(StudentModel::from_file_with_options(
+            path, options,
+        )?))
     }
 
     pub fn model(&self) -> &StudentModel {

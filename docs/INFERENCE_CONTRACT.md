@@ -72,8 +72,35 @@ static_margin_cal, thrust_peak_n, gyro_noise`). `out_features = 2`; loops
 `stem`, `norm`, `alloc_logits`, `head_corr`, `head_conf`, `g_max`. Forward
 mirrors `potok_ai.student.py`: leaky recurrent state `h = 0.8·h + 0.2·tanh(...)`,
 loop outputs accumulated by `softmax(alloc_logits)·decay^loop`,
-`LayerNorm(total + source)`, corrections `tanh(|g_max|)·tanh(head_corr(z))`,
-confidence `sigmoid(head_conf(z))` (`src/student_runtime.rs:32-46`).
+`LayerNorm(total + source)`, corrections `bound·tanh(head_corr(z))`,
+confidence `sigmoid(head_conf(z))` (`src/student_runtime.rs:32-53`).
+
+**Command envelope (FIXRECIPE, 2026-11-23).** `g_max` (header offset 44 and the
+`[1]` record) is a **linear command bound in m/s²**, not the argument to `tanh`
+that the legacy spec used. Export layout, `version = 2` and the 32-byte SHA
+trailer are unchanged: a `g_max ≈ 10` export is an ordinary v2 file. The
+reader resolves one of three typed modes (`CommandBoundMode`, `LoadOptions`):
+
+| mode | bound | when |
+|---|---|---|
+| `EnvelopeMps2` | `min(g_max, envelope.accel)` | `g_max > 1.0`, or forced explicitly |
+| `LegacyV2Tanh` | `tanh(g_max)` | `g_max <= 1.0`, or forced explicitly |
+| `Auto` (default) | resolves to one of the above | `g_max > 1.0` → envelope, else legacy |
+
+The threshold is exact: `tanh(x) < 1` for every finite `x`, and the legacy
+Python default is exactly 1.0, so only a field strictly above 1 can be a
+linear m/s² bound value. `CommandEnvelope::DEFAULT`
+is **±10 m/s²**, mirroring the frozen Python `CommandEnvelope` and the
+simulator's `MAX_COMMAND_MPS2`; it is a unit contract, not a tuning knob.
+`StudentModel::from_bytes` / `from_file` use `Auto` + the default envelope;
+`from_bytes_with_options` / `from_file_with_options` are the typed flags for
+forcing a mode or supplying a custom envelope. In envelope mode a bound above
+the ceiling is a **loud refusal** (`CommandOutOfEnvelope`), never a silent
+clamp. A non-finite/non-positive bound, an invalid custom envelope, and a
+header-vs-record `g_max` disagreement are hard errors too. Legacy mode stays
+behind an explicit flag: there the field is a shape parameter, not a command.
+The emitted correction is `tanh(head)·bound` in both modes — the `tanh` shapes
+the head to `[-1,1]`; it no longer compresses the bound.
 
 ### 2.4 v3 fast model — `POTOKM3\0`, version 3
 
@@ -103,7 +130,10 @@ Records: `blocks.{b}.{rec_h,rec_x}.{weight,bias}`, `blocks.{b}.proj` (TSCT),
 `stem.{weight,bias}`, `norm.{weight,bias}`, `alloc_logits`,
 `head_corr.{weight,bias}`, `head_conf.{weight,bias}`, `g_max` (shape `[1]`,
 finite, > 0). The head bound exposed to consumers is `tanh(|g_max|)`
-(`src/model_v3.rs:358-426`).
+(`src/model_v3.rs:358-426`). This reader carries the same pre-FIXRECIPE bound
+and is **not** wired into `Runtime::load`; the envelope fix in this task
+covers the live student path (`src/student_runtime.rs`) only. Aligning
+`src/model_v3.rs:426` is a follow-up outside this task's file scope.
 
 **Wiring state.** `V3Model` is the canonical v3 reader: it is exported from
 the library (`src/lib.rs:15, 27`) and exercised byte-for-byte by
@@ -193,7 +223,9 @@ State semantics: a rejection emits `[0.0, 0.0]` and leaves `last_command` at the
 **last accepted** value, so a spike cannot move the rate reference. Reaching
 `max_misses` (default 3) latches the assistant off; a later valid sample does
 not clear the latch. `reset()` returns fresh state and is the only latch clear
-(`src/speculative_v3.rs:130-148`). Config validation is loud for non-finite or
+(`src/speculative_v3.rs:130-148`). The example bounds ±20 m/s² cover the
+±10 command envelope; a custom envelope needs matching guard limits. Config
+validation is loud for non-finite or
 inverted bounds, negative rates, `min_confidence` outside [0,1], and
 `max_misses == 0` (`src/speculative_v3.rs:79-115`). The default bounds
 `[(-20,20), (-20,20)]` are a conservative example, **not** a flight-certified
@@ -306,6 +338,10 @@ student model file truncated | not a POTOKM1 model file | unsupported export ver
 model_kind {k} is not the stateful student (2) | student SHA256 checksum mismatch
 invalid student field: {s} | unknown student layer kind {k} | missing student layer {s}
 student shape mismatch: {s} | invalid ternary code {c} | student layer name is not UTF-8
+invalid student g_max {v}: must be finite and positive m/s^2
+command envelope must be finite and positive m/s^2, got {v}
+student g_max {g} m/s^2 exceeds the command envelope ceiling {c} m/s^2; re-export with g_max within the envelope or pass an explicit CommandEnvelope
+student g_max header {h} != g_max record {r} m/s^2
 
 v3 model file truncated | not a POTOKM3 model file | unsupported export version {v}
 model_kind {k} is not the v3 fast model (2) | unsupported v3 target version {v}

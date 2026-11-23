@@ -1,12 +1,15 @@
 //! Frame-to-frame safety state: sliding window, phase gate, sequence and
 //! miss accounting. No I/O and no allocation happens per frame.
 
+use crate::calibration_v3::Calibration;
 use crate::format_v2::ModelV2;
 use crate::frame::{
     ReplyFrame, RequestFrame, CORRECTION_SCALE, FLAG_MOTOR_ARMED, PHASE_ARMED, PHASE_FAULT,
     PHASE_IDLE,
 };
 use crate::model::{Model, Scratch};
+use crate::model_v3::V3Model;
+use crate::simd::dot;
 use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
@@ -64,10 +67,174 @@ pub struct Counters {
     pub disables: u64,
 }
 
-/// One of the two supported model formats, behind the same fixed window API.
+/// The sensor part of a request frame, in floats. The remaining v3 physics
+/// slots (8..14) are zero and the six conditioning slots (14..20) come from
+/// `conditioning`; this is the smart-frame layout of `student_runtime.rs`.
+const SENSOR_FEATURES: usize = 8;
+const V3_CONDITIONING_START: usize = 14;
+const V3_WINDOW: usize = 50;
+
+/// Stateful v3 fast-model runner. `V3Model` is the SHA-verified reader; this
+/// struct owns only the reusable hot-loop buffers and replays the Runtime's
+/// 50-frame sensor window through the reader's dequantized weights. The tick
+/// math is the canonical `StatefulTCN.step` mirrored in `student_runtime.rs`.
+struct V3Engine {
+    model: V3Model,
+    calibration: Option<Calibration>,
+    h: Vec<f32>,
+    cand: Vec<f32>,
+    next_source: Vec<f32>,
+    source: Vec<f32>,
+    total: Vec<f32>,
+    z: Vec<f32>,
+    frame: Vec<f32>,
+    alloc: Vec<f32>,
+    conditioning: [f32; 6],
+}
+
+impl V3Engine {
+    fn new(model: V3Model, calibration: Option<Calibration>) -> Self {
+        assert_eq!(model.in_features, crate::model_v3::IN_FEATURES);
+        assert_eq!(model.out_features, crate::model_v3::OUT_FEATURES);
+        let n = model.n_blocks * model.width;
+        let mut alloc = vec![0.0f32; model.n_loops];
+        let mut max = f32::NEG_INFINITY;
+        for (l, dst) in alloc.iter_mut().enumerate().take(model.n_loops) {
+            *dst = model.alloc[l];
+            max = max.max(*dst);
+        }
+        let mut sum = 0.0f32;
+        for a in alloc.iter_mut() {
+            *a = (*a - max).exp();
+            sum += *a;
+        }
+        for a in alloc.iter_mut() {
+            *a /= sum;
+        }
+        Self {
+            h: vec![0.0; n],
+            cand: vec![0.0; model.width],
+            next_source: vec![0.0; model.width],
+            source: vec![0.0; model.width],
+            total: vec![0.0; model.width],
+            z: vec![0.0; model.width],
+            frame: vec![0.0; model.in_features],
+            alloc,
+            conditioning: [0.0; 6],
+            model,
+            calibration,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.h.fill(0.0);
+    }
+
+    /// Replay the whole window from a clean state and return the last tick.
+    /// The Runtime shifts its window one frame per request, so replay gives the
+    /// same hidden state as an incremental step without carrying state across
+    /// requests (and without a second inference path to keep in sync).
+    fn forward(&mut self, window: &[f32]) -> [f32; 3] {
+        assert_eq!(
+            window.len() % SENSOR_FEATURES,
+            0,
+            "v3 window holds whole sensor frames"
+        );
+        self.reset();
+        let mut out = [0.0f32; 3];
+        for sensors in window.as_chunks::<SENSOR_FEATURES>().0 {
+            out = self.step(sensors);
+        }
+        out
+    }
+
+    fn step(&mut self, sensors: &[f32]) -> [f32; 3] {
+        self.frame.fill(0.0);
+        let n = sensors.len().min(self.frame.len());
+        self.frame[..n].copy_from_slice(&sensors[..n]);
+        self.frame[V3_CONDITIONING_START..].copy_from_slice(&self.conditioning);
+
+        let w = self.model.width;
+        for o in 0..w {
+            let row =
+                &self.model.stem_w[o * self.model.in_features..(o + 1) * self.model.in_features];
+            self.source[o] = dot(row, &self.frame) + self.model.stem_b[o];
+        }
+        self.total.fill(0.0);
+        for iteration in 0..self.model.n_loops {
+            for (b, block) in self.model.blocks.iter().enumerate() {
+                let h_prev = &self.h[b * w..(b + 1) * w];
+                for o in 0..w {
+                    let rh = &block.rec_h_w[o * w..(o + 1) * w];
+                    let rx = &block.rec_x_w[o * w..(o + 1) * w];
+                    let acc = dot(rx, &self.source)
+                        + dot(rh, h_prev)
+                        + block.rec_x_b[o]
+                        + block.rec_h_b[o];
+                    self.cand[o] = 0.8 * h_prev[o] + 0.2 * acc.tanh();
+                }
+                for o in 0..w {
+                    self.next_source[o] = dot(&block.proj_w[o * w..(o + 1) * w], &self.cand);
+                }
+                self.source.copy_from_slice(&self.next_source);
+                self.h[b * w..(b + 1) * w].copy_from_slice(&self.cand);
+            }
+            let weight = self.alloc[iteration] * self.model.decay.powi(iteration as i32);
+            for o in 0..w {
+                self.total[o] += weight * self.source[o];
+            }
+        }
+        for o in 0..w {
+            self.next_source[o] = self.total[o] + self.source[o];
+        }
+        crate::model_v3::layer_norm(
+            &self.next_source,
+            &self.model.norm_w,
+            &self.model.norm_b,
+            &mut self.z,
+        );
+        let mut out = [0.0f32; 3];
+        for (k, dst) in out.iter_mut().enumerate().take(self.model.out_features) {
+            *dst = dot(&self.model.head_corr_w[k * w..(k + 1) * w], &self.z)
+                + self.model.head_corr_b[k];
+            *dst = dst.tanh() * self.model.correction_bound;
+        }
+        let logit = dot(&self.model.head_conf_w[..w], &self.z) + self.model.head_conf_b[0];
+        out[2] = match &self.calibration {
+            Some(c) if logit.is_finite() => c.apply_logit(logit as f64).unwrap_or(0.0) as f32,
+            _ => 1.0 / (1.0 + (-logit).exp()),
+        };
+        // The calibrated threshold is the adaptive-compute cut: normally it
+        // escalates to a windowed teacher. A bare Runtime has no teacher, so it
+        // withholds the correction below the cut rather than guessing.
+        if let Some(c) = &self.calibration {
+            if (out[2] as f64) < c.threshold() {
+                out[0] = 0.0;
+                out[1] = 0.0;
+            }
+        }
+        out
+    }
+
+    fn memory_bytes(&self) -> usize {
+        self.model.memory_bytes()
+            + (self.h.len()
+                + self.cand.len()
+                + self.next_source.len()
+                + self.source.len()
+                + self.total.len()
+                + self.z.len()
+                + self.frame.len()
+                + self.alloc.len())
+                * std::mem::size_of::<f32>()
+    }
+}
+
+/// One of the three supported model formats, behind the same fixed window API.
 enum Engine {
     PotM { model: Model, scratch: Scratch },
     V2(ModelV2),
+    V3(Box<V3Engine>),
 }
 
 impl Engine {
@@ -75,6 +242,7 @@ impl Engine {
         match self {
             Self::PotM { model, .. } => model.window,
             Self::V2(m) => m.window,
+            Self::V3(_) => V3_WINDOW,
         }
     }
 
@@ -82,6 +250,7 @@ impl Engine {
         match self {
             Self::PotM { .. } => MAX_CORRECTION,
             Self::V2(m) => m.g_max,
+            Self::V3(e) => e.model.correction_bound,
         }
     }
 
@@ -92,6 +261,7 @@ impl Engine {
                 [p, y, c]
             }
             Self::V2(m) => m.forward(window),
+            Self::V3(e) => e.forward(window),
         }
     }
 
@@ -99,13 +269,14 @@ impl Engine {
         match self {
             Self::PotM { model, scratch } => model.memory_bytes() + scratch.memory_bytes(),
             Self::V2(m) => m.memory_bytes(),
+            Self::V3(e) => e.memory_bytes(),
         }
     }
 
     fn potm(&self) -> Option<&Model> {
         match self {
             Self::PotM { model, .. } => Some(model),
-            Self::V2(_) => None,
+            Self::V2(_) | Self::V3(_) => None,
         }
     }
 }
@@ -146,12 +317,25 @@ impl Runtime {
         Self::from_engine(Engine::V2(model), policy)
     }
 
-    /// Load either format by its magic bytes: `POTOKM1\0` selects the v2
-    /// reader, everything else goes to the legacy POTM reader.
+    pub fn from_v3(model: V3Model) -> Self {
+        Self::with_policy_v3(model, PhasePolicy::default())
+    }
+
+    pub fn with_policy_v3(model: V3Model, policy: PhasePolicy) -> Self {
+        Self::from_engine(Engine::V3(Box::new(V3Engine::new(model, None))), policy)
+    }
+
+    /// Load one of the three formats by its magic bytes: `POTOKM3\0` selects
+    /// the v3 reader, `POTOKM1\0` the v2 reader, everything else the legacy
+    /// POTM reader. Each reader verifies its own SHA-256 before parsing.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
         let bytes = fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        if bytes.starts_with(&crate::format_v2::MAGIC) {
+        if bytes.starts_with(&crate::model_v3::MAGIC) {
+            V3Model::from_bytes(&bytes)
+                .map(Self::from_v3)
+                .map_err(|e| e.to_string())
+        } else if bytes.starts_with(&crate::format_v2::MAGIC) {
             ModelV2::from_bytes(&bytes)
                 .map(Self::from_v2)
                 .map_err(|e| e.to_string())
@@ -160,6 +344,27 @@ impl Runtime {
                 .map(Self::new)
                 .map_err(|e| e.to_string())
         }
+    }
+
+    /// Load a v3 model together with its `calibration_v3` export. The model
+    /// still goes through [`Self::load`]'s SHA-verified reader; the calibration
+    /// supplies the confidence transform and the adaptive-compute threshold.
+    /// Other formats are refused: calibration is a v3 contract.
+    pub fn load_with_calibration(
+        model_path: impl AsRef<Path>,
+        calibration_path: impl AsRef<Path>,
+    ) -> Result<Self, String> {
+        let bytes = fs::read(model_path.as_ref())
+            .map_err(|e| format!("cannot read {}: {e}", model_path.as_ref().display()))?;
+        if !bytes.starts_with(&crate::model_v3::MAGIC) {
+            return Err("calibration requires a POTOKM3 v3 model".to_owned());
+        }
+        let model = V3Model::from_bytes(&bytes).map_err(|e| e.to_string())?;
+        let calibration = Calibration::from_file(calibration_path).map_err(|e| e.to_string())?;
+        Ok(Self::from_engine(
+            Engine::V3(Box::new(V3Engine::new(model, Some(calibration)))),
+            PhasePolicy::default(),
+        ))
     }
 
     fn from_engine(engine: Engine, policy: PhasePolicy) -> Self {
@@ -182,13 +387,42 @@ impl Runtime {
     }
 
     /// The legacy model, when this runtime holds one (used by the naive
-    /// baseline benchmark). Returns `None` for v2 models.
+    /// baseline benchmark). Returns `None` for v2 and v3 models.
     pub fn potm_model(&self) -> Option<&Model> {
         self.engine.potm()
     }
 
     pub fn is_v2(&self) -> bool {
         matches!(self.engine, Engine::V2(_))
+    }
+
+    pub fn is_v3(&self) -> bool {
+        matches!(self.engine, Engine::V3(_))
+    }
+
+    /// The data-derived adaptive-compute cut, when this runtime was loaded
+    /// with calibration. `None` for v2/legacy and for an uncalibrated v3 load.
+    pub fn v3_threshold(&self) -> Option<f64> {
+        match &self.engine {
+            Engine::V3(e) => e.calibration.as_ref().map(|c| c.threshold()),
+            _ => None,
+        }
+    }
+
+    /// Six conditioning numbers appended to each v3 smart frame (physics slots
+    /// 14..20). Ignored by the other formats.
+    pub fn set_v3_conditioning(&mut self, conditioning: [f32; 6]) {
+        if let Engine::V3(e) = &mut self.engine {
+            e.conditioning = conditioning;
+        }
+    }
+
+    /// The verified v3 reader, when this runtime holds one.
+    pub fn v3_model(&self) -> Option<&V3Model> {
+        match &self.engine {
+            Engine::V3(e) => Some(&e.model),
+            _ => None,
+        }
     }
 
     pub fn is_disabled(&self) -> bool {

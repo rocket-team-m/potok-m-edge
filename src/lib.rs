@@ -20,6 +20,7 @@ pub mod speculative_v3;
 pub mod student_runtime;
 pub mod uart;
 
+pub use calibration_v3::{Calibration, CalibrationError, Method};
 pub use format_v2::{ModelV2, V2Error};
 pub use frame::{FrameError, FrameLayout, ReplyFrame, RequestFrame};
 pub use lowlat::LowlatLayout;

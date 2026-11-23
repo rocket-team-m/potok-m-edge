@@ -129,21 +129,28 @@ the head to `[-1,1]`; it no longer compresses the bound.
 Records: `blocks.{b}.{rec_h,rec_x}.{weight,bias}`, `blocks.{b}.proj` (TSCT),
 `stem.{weight,bias}`, `norm.{weight,bias}`, `alloc_logits`,
 `head_corr.{weight,bias}`, `head_conf.{weight,bias}`, `g_max` (shape `[1]`,
-finite, > 0). The head bound exposed to consumers is `tanh(|g_max|)`
-(`src/model_v3.rs:358-426`). This reader carries the same pre-FIXRECIPE bound
-and is **not** wired into `Runtime::load`; the envelope fix in this task
-covers the live student path (`src/student_runtime.rs`) only. Aligning
-`src/model_v3.rs:426` is a follow-up outside this task's file scope.
+finite, > 0). The bound is no longer `tanh(|g_max|)` (FIXRECIPE, 2026-11-23):
+the v3 reader resolves the same typed `CommandBoundMode` as the v2 student
+reader (§2.3, `src/model_v3.rs:144-156, 480-492`). `EnvelopeMps2` uses
+`min(g_max, envelope.accel)`; `LegacyV2Tanh` keeps `tanh(g_max)` for
+pre-FIXRECIPE exports; the default `Auto` picks by field value — `g_max > 1.0`
+can only be a linear bound, since `tanh(x) < 1` for every finite `x` and the
+legacy Python default is exactly 1.0. The envelope is **±10 m/s²**
+(`CommandEnvelope::DEFAULT`), a unit contract, not a tuning knob. A bound above
+the ceiling, a non-finite/non-positive bound, and a header-vs-record `g_max`
+disagreement are loud refusals, never silent clamps. The emitted correction is
+`tanh(head)·bound` in both modes.
 
 **Wiring state.** `V3Model` is the canonical v3 reader: it is exported from
-the library (`src/lib.rs:15, 27`) and exercised byte-for-byte by
+the library (`src/lib.rs:15, 28`) and exercised byte-for-byte by
 `tests/model_v3_tests.rs`. `src/speculative_v3.rs` is a predictor-agnostic
-dispatch/guard with fixture-driven gates. `Runtime::load` still dispatches only
-on `POTOKM1\0` versus the legacy POTM reader (`src/runtime.rs:149-163`): a
-`POTOKM3\0` file is not loaded by the production entry point, and calibration is
-not applied in the dispatch path (§4). These are integration gaps, not format
-differences — the reader and the guard exist, but neither is wired into
-`Runtime::load` yet.
+dispatch/guard with fixture-driven gates. `Runtime::load` now dispatches
+`POTOKM3\0` through `V3Model::from_bytes_with_options` with
+`LoadOptions::default()` — the same `Auto` mode and default ±10 m/s² envelope
+as the v2 student path — ahead of the `POTOKM1\0` v2 reader and the legacy
+POTM reader (`src/runtime.rs:332-347`). A `V3Engine` replays the 50-frame window
+through the dequantized weights and emits `tanh(head)·correction_bound`; the
+reader verifies SHA-256 before any layer is parsed (§3).
 
 ## 3. SHA policy
 
